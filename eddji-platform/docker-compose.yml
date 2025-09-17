@@ -1,0 +1,229 @@
+version: "3.8"
+
+x-env: &default-env
+  env_file: ./.env
+
+networks:
+  eddji_net:
+
+volumes:
+  erpnext_sites:
+  erpnext_db:
+  logs:
+
+services:
+  # ------------------ DB ------------------
+  mariadb:
+    image: mariadb:10.6
+    container_name: eddji_db
+    restart: unless-stopped
+    <<: *default-env
+    environment:
+      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+      MARIADB_DATABASE: frappe
+      MARIADB_USER: frappe
+      MARIADB_PASSWORD: ${DB_PASSWORD}
+    command: ["--character-set-server=utf8mb4", "--collation-server=utf8mb4_unicode_ci"]
+    volumes:
+      - erpnext_db:/var/lib/mysql
+    networks:
+      - eddji_net
+
+  # -------------- Redis cluster ------------
+  redis-cache:
+    image: redis:6.2-alpine
+    container_name: eddji_redis_cache
+    restart: unless-stopped
+    networks:
+      - eddji_net
+
+  redis-queue:
+    image: redis:6.2-alpine
+    container_name: eddji_redis_queue
+    restart: unless-stopped
+    networks:
+      - eddji_net
+
+  redis-socketio:
+    image: redis:6.2-alpine
+    container_name: eddji_redis_socketio
+    restart: unless-stopped
+    networks:
+      - eddji_net
+
+  # -------------- ERPNext core -------------
+  backend:
+    image: frappe/erpnext:${ERPNEXT_VERSION}
+    container_name: eddji_backend
+    restart: unless-stopped
+    depends_on:
+      - mariadb
+      - redis-cache
+      - redis-queue
+      - redis-socketio
+    volumes:
+      - erpnext_sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    networks:
+      - eddji_net
+
+  frontend:
+    image: frappe/erpnext:${ERPNEXT_VERSION}
+    container_name: eddji_frontend
+    restart: unless-stopped
+    command: ["nginx-entrypoint.sh"]
+    depends_on:
+      - backend
+    volumes:
+      - erpnext_sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    networks:
+      - eddji_net
+
+  scheduler:
+    image: frappe/erpnext:${ERPNEXT_VERSION}
+    container_name: eddji_scheduler
+    restart: unless-stopped
+    command: ["scheduler"]
+    depends_on:
+      - backend
+    volumes:
+      - erpnext_sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    networks:
+      - eddji_net
+
+  worker-default:
+    image: frappe/erpnext:${ERPNEXT_VERSION}
+    container_name: eddji_worker_default
+    restart: unless-stopped
+    command: ["worker","--queue","default"]
+    depends_on:
+      - backend
+    volumes:
+      - erpnext_sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    networks:
+      - eddji_net
+
+  worker-short:
+    image: frappe/erpnext:${ERPNEXT_VERSION}
+    container_name: eddji_worker_short
+    restart: unless-stopped
+    command: ["worker","--queue","short"]
+    depends_on:
+      - backend
+    volumes:
+      - erpnext_sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    networks:
+      - eddji_net
+
+  worker-long:
+    image: frappe/erpnext:${ERPNEXT_VERSION}
+    container_name: eddji_worker_long
+    restart: unless-stopped
+    command: ["worker","--queue","long"]
+    depends_on:
+      - backend
+    volumes:
+      - erpnext_sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    networks:
+      - eddji_net
+
+  socketio:
+    image: frappe/erpnext:${ERPNEXT_VERSION}
+    container_name: eddji_socketio
+    restart: unless-stopped
+    command: ["node","/home/frappe/frappe-bench/apps/frappe/socketio.js"]
+    depends_on:
+      - backend
+    volumes:
+      - erpnext_sites:/home/frappe/frappe-bench/sites
+    networks:
+      - eddji_net
+
+  # --- ERPNext site creation/config ---
+  create-sites:
+    image: frappe/erpnext:${ERPNEXT_VERSION}
+    container_name: eddji_create_sites
+    restart: "no"
+    <<: *default-env
+    entrypoint: ["/bin/bash","-c"]
+    command: >
+      bash /scripts/create_sites.sh
+    volumes:
+      - ./erpnext/scripts:/scripts
+      - erpnext_sites:/home/frappe/frappe-bench/sites
+    depends_on:
+      - mariadb
+      - backend
+      - redis-cache
+      - redis-queue
+      - redis-socketio
+    networks:
+      - eddji_net
+
+  # ---------------- Nuxt sites ----------------
+  nuxt_eddji:
+    build: ./nuxt-eddji
+    container_name: site_eddji
+    restart: unless-stopped
+    environment:
+      NITRO_PORT: ${NUXT_EDDJI_PORT}
+      PORT: ${NUXT_EDDJI_PORT}
+      HOST: 0.0.0.0
+    networks:
+      - eddji_net
+    command: ["node",".output/server/index.mjs"]
+
+  # ---------------- AI Services ----------------
+  route_optimizer:
+    build: ./ai-services/route-optimizer
+    container_name: route_optimizer
+    restart: unless-stopped
+    environment:
+      PORT: ${ROUTE_OPTIMIZER_PORT}
+    networks:
+      - eddji_net
+
+  eta_predictor:
+    build: ./ai-services/eta-predictor
+    container_name: eta_predictor
+    restart: unless-stopped
+    environment:
+      PORT: ${ETA_PREDICTOR_PORT}
+    networks:
+      - eddji_net
+
+  # ---------------- Nginx proxy ----------------
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: eddji_nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./infra/nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./infra/certbot/www:/var/www/certbot
+      - ./infra/certbot/conf:/etc/letsencrypt
+    depends_on:
+      - nuxt_eddji
+      - frontend
+      - route_optimizer
+      - eta_predictor
+    networks:
+      - eddji_net
+
+  certbot:
+    image: certbot/certbot:v2.11.0
+    container_name: eddji_certbot
+    volumes:
+      - ./infra/certbot/www:/var/www/certbot
+      - ./infra/certbot/conf:/etc/letsencrypt
+    entrypoint: /bin/sh -c
+    command: "trap exit TERM; while :; do sleep 6h & wait $${!}; certbot renew; done"
+    networks:
+      - eddji_net
